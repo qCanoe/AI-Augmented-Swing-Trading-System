@@ -9,6 +9,7 @@ import click
 
 from ai_trading import __version__
 from ai_trading.config import get_settings
+from ai_trading.pipeline import run_trading_cycle
 from ai_trading.utils.logging import get_logger, setup_logging
 
 
@@ -66,20 +67,14 @@ def once(dry_run: bool) -> None:
             sys.exit(1)
 
     try:
-        # TODO: 实现完整的交易循环
-        # 1. 拉取市场数据
-        # 2. 计算指标
-        # 3. 生成候选交易
-        # 4. 构建市场快照
-        # 5. 调用 LLM 决策
-        # 6. 风控检查
-        # 7. 执行交易（纸交易或实盘）
-        # 8. 记录日志
-
+        result = run_trading_cycle(settings, dry_run=dry_run)
         logger.info(
             "run_completed",
-            status="success",
-            message="Single run completed (skeleton mode, core logic pending)",
+            status=result.status,
+            elapsed_ms=round(result.elapsed_ms, 2),
+            decisions=len(result.decisions),
+            orders=len(result.orders),
+            warnings=result.warnings,
         )
 
     except KeyboardInterrupt:
@@ -148,12 +143,15 @@ def loop(interval_min: int, dry_run: bool) -> NoReturn:
             )
 
             try:
-                # TODO: 调用核心交易逻辑
-                # run_trading_cycle(settings, dry_run)
+                result = run_trading_cycle(settings, dry_run=dry_run)
                 logger.info(
                     "loop_iteration_completed",
                     iteration=iteration,
-                    message="Iteration completed (skeleton mode)",
+                    status=result.status,
+                    elapsed_ms=round(result.elapsed_ms, 2),
+                    decisions=len(result.decisions),
+                    orders=len(result.orders),
+                    warnings=result.warnings,
                 )
 
             except Exception as e:

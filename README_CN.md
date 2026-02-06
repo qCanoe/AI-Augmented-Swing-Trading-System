@@ -48,10 +48,10 @@ cp config.example.env .env
 
 ```bash
 # 单次运行（拉数据 → 决策 → 执行/记录）
-python -m ai_trading.main --once
+python -m ai_trading.main once
 
 # 循环运行（每15分钟一轮）
-python -m ai_trading.main --loop --interval-min 15
+python -m ai_trading.main loop --interval-min 15
 
 # 查看帮助
 python -m ai_trading.main --help

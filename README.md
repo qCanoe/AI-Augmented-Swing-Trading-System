@@ -48,10 +48,10 @@ cp config.example.env .env
 
 ```bash
 # Single run (fetch data → decision → execute/record)
-python -m ai_trading.main --once
+python -m ai_trading.main once
 
 # Loop run (every 15 minutes)
-python -m ai_trading.main --loop --interval-min 15
+python -m ai_trading.main loop --interval-min 15
 
 # View help
 python -m ai_trading.main --help

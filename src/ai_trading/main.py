@@ -3,11 +3,23 @@
 import sys
 import time
 from datetime import datetime
-from typing import NoReturn
+from pathlib import Path
+from typing import NoReturn, cast
 
 import click
 
 from ai_trading import __version__
+from ai_trading.backtest import (
+    AIDecisionProvider,
+    BacktestConfig,
+    ExperimentMode,
+    HeuristicDecisionProvider,
+    OpenRouterDecisionProvider,
+    SegmentSpec,
+    fetch_binance_history_with_cache,
+    load_ohlcv_csv,
+    run_backtest_suite,
+)
 from ai_trading.config import get_settings
 from ai_trading.pipeline import run_trading_cycle
 from ai_trading.utils.logging import get_logger, setup_logging
@@ -287,6 +299,151 @@ def check() -> None:
         click.echo("[ERROR] Some dependencies missing. Run: pip install -e .")
 
     logger.info("dependency_check_completed", all_ok=all_ok)
+
+
+@cli.command()
+@click.option(
+    "--ohlcv-4h-csv",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help="4H OHLCV CSV 路径。若不提供则从 Binance 拉取。",
+)
+@click.option(
+    "--ohlcv-1d-csv",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help="1D OHLCV CSV 路径。若不提供则从 Binance 拉取。",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("data/backtest"),
+    help="回测输出目录。",
+)
+@click.option("--symbol", default="BTCUSDT", show_default=True, help="回测标的。")
+@click.option(
+    "--ai-provider",
+    type=click.Choice(["heuristic", "openrouter"], case_sensitive=False),
+    default="heuristic",
+    show_default=True,
+    help="AI 决策来源。",
+)
+@click.option("--limit-4h", default=1500, show_default=True, help="4H 拉取数量。")
+@click.option("--limit-1d", default=1000, show_default=True, help="1D 拉取数量。")
+@click.option(
+    "--segment",
+    "segment_specs",
+    multiple=True,
+    help="分段格式：name,start_iso,end_iso，可重复传入。",
+)
+def backtest(
+    ohlcv_4h_csv: Path | None,
+    ohlcv_1d_csv: Path | None,
+    output_dir: Path,
+    symbol: str,
+    ai_provider: str,
+    limit_4h: int,
+    limit_1d: int,
+    segment_specs: tuple[str, ...],
+) -> None:
+    """执行 BTC-only 三组对比回测并输出评估报告。"""
+    setup_logging()
+    logger = get_logger("ai_trading.main")
+    settings = get_settings()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if (ohlcv_4h_csv is None) != (ohlcv_1d_csv is None):
+        raise click.ClickException("必须同时提供 --ohlcv-4h-csv 与 --ohlcv-1d-csv，或都不提供。")
+
+    if ohlcv_4h_csv is not None and ohlcv_1d_csv is not None:
+        df_4h = load_ohlcv_csv(ohlcv_4h_csv)
+        df_1d = load_ohlcv_csv(ohlcv_1d_csv)
+        source = "csv"
+    else:
+        cache_dir = output_dir / "cache"
+        df_4h, df_1d = fetch_binance_history_with_cache(
+            settings,
+            symbol=symbol,
+            limit_4h=limit_4h,
+            limit_1d=limit_1d,
+            cache_dir=cache_dir,
+        )
+        source = "binance"
+
+    segments = [_parse_segment_spec(item) for item in segment_specs]
+    provider: AIDecisionProvider
+    if ai_provider.lower() == "heuristic":
+        provider = HeuristicDecisionProvider()
+    else:
+        provider = OpenRouterDecisionProvider(settings)
+    config = BacktestConfig(symbol=symbol)
+
+    report = run_backtest_suite(
+        settings=settings,
+        config=config,
+        df_4h=df_4h,
+        df_1d=df_1d,
+        ai_provider=provider,
+        output_dir=output_dir,
+        source=source,
+        segments=segments if segments else None,
+    )
+
+    baseline = report.experiments["baseline"].metrics
+    selected_mode_raw = report.go_no_go.get("selected_ai_mode")
+    selected_mode: ExperimentMode = "ai_filter_sizing"
+    if isinstance(selected_mode_raw, str) and selected_mode_raw in {
+        "baseline",
+        "ai_filter",
+        "ai_filter_sizing",
+    }:
+        selected_mode = cast(ExperimentMode, selected_mode_raw)
+
+    ai_metrics = report.experiments[selected_mode].metrics
+    baseline_dd_raw = baseline.get("max_drawdown_pct", 0.0)
+    ai_dd_raw = ai_metrics.get("max_drawdown_pct", 0.0)
+    baseline_dd = float(baseline_dd_raw) if isinstance(baseline_dd_raw, (int, float)) else 0.0
+    ai_dd = float(ai_dd_raw) if isinstance(ai_dd_raw, (int, float)) else 0.0
+
+    click.echo("=" * 60)
+    click.echo("Backtest Completed")
+    click.echo("=" * 60)
+    click.echo(f"Output Dir: {output_dir}")
+    click.echo(f"Source: {source}")
+    click.echo(
+        f"Baseline DD: {baseline_dd:.2f}% | "
+        f"AI DD: {ai_dd:.2f}%"
+    )
+    click.echo(
+        f"Go/No-Go: {'GO' if bool(report.go_no_go.get('go')) else 'NO-GO'} "
+        f"({report.go_no_go.get('selected_ai_mode', 'n/a')})"
+    )
+    click.echo("=" * 60)
+
+    logger.info(
+        "backtest_completed",
+        output_dir=str(output_dir),
+        source=source,
+        go=bool(report.go_no_go.get("go")),
+        selected_ai_mode=report.go_no_go.get("selected_ai_mode"),
+    )
+
+
+def _parse_segment_spec(text: str) -> SegmentSpec:
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 3:
+        raise click.ClickException(
+            f"非法 segment 格式: {text}，正确格式应为 name,start_iso,end_iso"
+        )
+    name, start_at, end_at = parts
+    try:
+        start_dt = datetime.fromisoformat(start_at)
+        end_dt = datetime.fromisoformat(end_at)
+    except ValueError as exc:
+        raise click.ClickException(f"非法时间格式: {text}") from exc
+    if start_dt > end_dt:
+        raise click.ClickException(f"segment 起止时间错误: {text}")
+    return SegmentSpec(name=name, start_at=start_at, end_at=end_at)
 
 
 # 支持 python -m ai_trading.main 调用
